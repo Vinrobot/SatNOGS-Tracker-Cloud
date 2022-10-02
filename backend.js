@@ -1,3 +1,5 @@
+const { BlobServiceClient } = require('@azure/storage-blob');
+
 const express = require('express')
 
 const axios = require('axios');
@@ -6,23 +8,28 @@ const port = 8080
 const dotenv = require('dotenv')
 dotenv.config()
 
-// Load the TLE file from the S3 bucket
-const AWS = require('aws-sdk')
-const IS_GOOGLE = process.env.IS_GOOGLE || false
-const AWS_KEY = process.env.AWS_KEY
-const AWS_SECRET = process.env.AWS_SECRET
-const BUCKET_NAME = process.env.BUCKET_NAME
 
-var s3Config = {
-    accessKeyId: AWS_KEY,
-    secretAccessKey: AWS_SECRET
+const AZURE_STORAGE_CONNECTION_STRING = process.env.AZURE_STORAGE_CONNECTION_STRING;
+if (!AZURE_STORAGE_CONNECTION_STRING) {
+    throw Error("Azure Storage Connection string not found");
+}
+const AZURE_STORAGE_CONTAINER_NAME = process.env.AZURE_STORAGE_CONTAINER_NAME;
+if (!AZURE_STORAGE_CONTAINER_NAME) {
+    throw Error("Azure Storage Container name not found");
 }
 
-if (IS_GOOGLE) {
-    s3Config.endpoint = "https://storage.googleapis.com"
-}
+const blobServiceClient = BlobServiceClient.fromConnectionString(AZURE_STORAGE_CONNECTION_STRING);
+const containerClient = blobServiceClient.getContainerClient(AZURE_STORAGE_CONTAINER_NAME);
+containerClient.create().then(() => {}, () => {});
 
-const s3 = new AWS.S3(s3Config)
+async function streamToText(readable) {
+    readable.setEncoding('utf8');
+    let data = '';
+    for await (const chunk of readable) {
+        data += chunk;
+    }
+    return data;
+}
 
 var lastTleUpdate = new Date()
 var lastStationsUpdate = new Date()
@@ -41,19 +48,9 @@ async function updateTleFile() {
     console.log("Updating TLEs")
     tle = await axios('https://www.celestrak.com/NORAD/elements/active.txt')
     tleData = parseTLE(tle.data)
-    // Write the TLE file to the S3 bucket
-    const params = {
-        Bucket: BUCKET_NAME,
-        Key: "tle.json",
-        Body: JSON.stringify(tleData)
-    }
-    s3.putObject(params, function (err, data) {
-        if (err) {
-            console.log(err)
-        } else {
-            console.log(data)
-        }
-    })
+    // Write the TLE file to the Blob storage
+    const data = JSON.stringify(tleData);
+    await containerClient.getBlockBlobClient("tle.json").upload(data, data.length);
 }
 
 async function updateStationsFile() {
@@ -68,7 +65,7 @@ async function updateStationsFile() {
             page++
             try {
                 var body = await axios(reqStr)
-                var data = body.data
+                let data = body.data
                 console.log(data)
                 data.forEach(el => {
                     stations.push(el)
@@ -79,20 +76,10 @@ async function updateStationsFile() {
             }
             console.log(stations.length)
         } while (!done);
-        
-        // Write the stations file to the S3 bucket
-        const params = {
-            Bucket: BUCKET_NAME,
-            Key: "stations.json",
-            Body: JSON.stringify(stations)
-        }
-        s3.putObject(params, function (err, data) {
-            if (err) {
-                reject(err)
-            } else {
-                resolve()
-            }
-        })
+
+        // Write the stations file to the Blob storage
+        const data = JSON.stringify(stations);
+        await containerClient.getBlockBlobClient("stations.json").upload(data, data.length);
     })
 }
 
@@ -102,18 +89,10 @@ app.get('/api/tle', async (req, res) => {
         await updateTleFile()
         lastTleUpdate = new Date()
     }
-    // Get the TLE file from the S3 bucket
-    const params = {
-        Bucket: BUCKET_NAME,
-        Key: "tle.json"
-    }
-    s3.getObject(params, function (err, data) {
-        if (err) {
-            console.log(err)
-        } else {
-            res.send(data.Body.toString())
-        }
-    })
+    // Get the TLE file from the Blob storage
+    const downloadBlockBlobResponse = await containerClient.getBlockBlobClient("tle.json").download(0);
+    const response = await streamToText(downloadBlockBlobResponse.readableStreamBody);
+    res.send(response.toString());
 })
 
 app.get('/api/stations', async (req, res) => {
@@ -122,18 +101,10 @@ app.get('/api/stations', async (req, res) => {
         await updateStationsFile()
         lastStationsUpdate = new Date()
     }
-    // Get the stations file from the S3 bucket
-    const params = {
-        Bucket: BUCKET_NAME,
-        Key: "stations.json"
-    }
-    s3.getObject(params, function (err, data) {
-        if (err) {
-            console.log(err)
-        } else {
-            res.send(data.Body.toString())
-        }
-    })
+    // Get the stations file from the Blob storage
+    const downloadBlockBlobResponse = await containerClient.getBlockBlobClient("stations.json").download(0);
+    const response = await streamToText(downloadBlockBlobResponse.readableStreamBody);
+    res.send(response.toString());
 })
 
 updateStationsFile()
